@@ -1,0 +1,284 @@
+diff --git a/scripts/api_server.py b/scripts/api_server.py
+index 0b7cfa8..494296e 100644
+--- a/scripts/api_server.py
++++ b/scripts/api_server.py
+@@ -19,9 +19,9 @@ Two details that are easy to get wrong and are load-bearing here:
+    `max_num_tokens` is the budget across concurrent jobs, so the lock is not a
+    limitation of the server, it is the shape of the engine.
+ 
+-Surface: GET /health, GET /v1/models, POST /v1/chat/completions (stream and
+-non-stream). That is all on purpose -- this is how you point a client at the
+-measured-best configuration, not a production gateway.
++Surface: GET /health, GET /v1/models, POST /v1/chat/completions (including
++function tools), and POST /v1/responses (text only). The server never executes
++tools; clients such as Pi run them and supply the results on the next turn.
+ """
+ from __future__ import annotations
+ 
+@@ -33,6 +33,7 @@ import threading
+ import time
+ import traceback
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from tool_protocol import normalize_messages, parse_calls, validate_tools
+ 
+ MODEL_DIR = os.environ.get("MODEL_DIR", "/content/exl3")
+ SRC = os.environ.get("EXL3_SRC", "/content/exllamav3-src")
+@@ -234,13 +235,14 @@ def build_engine():
+           % (getattr(GEN, "cpu_page_cache", None) is not None), flush=True)
+ 
+ 
+-def render_chat(messages, template_kwargs=None):
++def render_chat(messages, template_kwargs=None, tools=None):
+     """Prefer the model's own chat template; fall back to ChatML."""
+     tpl_path = os.path.join(MODEL_DIR, "chat_template.jinja")
+     if JTemplate is not None and os.path.exists(tpl_path):
+         try:
+             src = open(tpl_path, encoding="utf-8").read()
+-            kw = {"messages": messages, "add_generation_prompt": True}
++            kw = {"messages": normalize_messages(messages), "add_generation_prompt": True,
++                  "tools": tools or []}
+             if template_kwargs:
+                 kw.update(template_kwargs)
+             out = JTemplate(src).render(**kw)
+@@ -248,6 +250,8 @@ def render_chat(messages, template_kwargs=None):
+                 return out, "jinja"
+         except Exception as exc:
+             print("[api] chat template failed (%r); falling back to ChatML" % exc, flush=True)
++    if tools:
++        raise ValueError("model chat template is required for tool calls")
+     parts = []
+     for m in messages:
+         parts.append("<|im_start|>%s\n%s<|im_end|>\n"
+@@ -631,7 +635,17 @@ class Handler(BaseHTTPRequestHandler):
+             return self._send(400, {"error": {"message": "messages must be a non-empty array",
+                                               "type": "invalid_request_error",
+                                               "param": "messages"}})
+-        prompt, how = render_chat(msgs, template_kwargs_from(req))
++        try:
++            tools = validate_tools(req.get("tools") or [])
++            choice = req.get("tool_choice", "auto")
++            if choice == "none":
++                tools = []
++            elif choice not in ("auto", "required", None) and not isinstance(choice, dict):
++                raise ValueError("unsupported tool_choice")
++            prompt, how = render_chat(msgs, template_kwargs_from(req), tools)
++        except (ValueError, TypeError, KeyError) as exc:
++            return self._send(400, {"error": {"message": str(exc),
++                                              "type": "invalid_request_error"}})
+         # OpenAI renamed max_tokens -> max_completion_tokens; accept both.
+         max_tokens = int(req.get("max_completion_tokens")
+                          or req.get("max_tokens") or 512)
+@@ -642,7 +656,9 @@ class Handler(BaseHTTPRequestHandler):
+         cid = "chatcmpl-%d" % int(time.time() * 1000)
+         model = req.get("model", "qwen3.8-flash-next-exl3")
+ 
+-        def finish_reason(r):
++        def finish_reason(r, calls=None):
++            if calls:
++                return "tool_calls"
+             return "length" if (r.get("eos_reason") or "") == "max_new_tokens" else "stop"
+ 
+         def report(r):
+@@ -674,12 +690,19 @@ class Handler(BaseHTTPRequestHandler):
+                 traceback.print_exc()
+                 return self._send(500, {"error": {"message": repr(exc)}})
+             reasoning, text = split_thinking(r.get("text") or "")
++            try:
++                text, calls = parse_calls(text, tools)
++            except ValueError as exc:
++                return self._send(502, {"error": {"message": str(exc), "type": "invalid_model_output"}})
+             report(r)
++            message = assistant_message(text, reasoning)
++            if calls:
++                message["tool_calls"] = calls
+             return self._send(200, {
+                 "id": cid, "object": "chat.completion", "created": int(time.time()),
+                 "model": model,
+-                "choices": [{"index": 0, "finish_reason": finish_reason(r),
+-                             "message": assistant_message(text, reasoning)}],
++                "choices": [{"index": 0, "finish_reason": finish_reason(r, calls),
++                             "message": message}],
+                 "usage": usage_for(r)})
+ 
+         # Genuinely incremental: text is forwarded while the engine decodes it,
+@@ -701,18 +724,46 @@ class Handler(BaseHTTPRequestHandler):
+                     self._sse_write("data: " + json.dumps(
+                         chunk({"content": piece})) + "\n\n")
+ 
++        last_heartbeat = [time.monotonic()]
++
++        def tool_heartbeat(_acc):
++            now_ = time.monotonic()
++            if now_ - last_heartbeat[0] >= 10:
++                self._sse_write(": generating tool response\n\n")
++                last_heartbeat[0] = now_
++
+         try:
+             r = collect(prompt, max_tokens, req.get("temperature"), req.get("top_p"),
+-                        stops, on_delta=lambda acc: emit(delta.feed(acc)))
++                        stops, on_delta=(tool_heartbeat if tools else lambda acc: emit(delta.feed(acc))))
+         except Exception as exc:
+             traceback.print_exc()
+             self._sse_write("data: " + json.dumps(
+                 {"error": {"message": repr(exc)}}) + "\n\n")
+             self._sse_write("data: [DONE]\n\n")
+             return self._sse_end()
+-        emit(delta.feed(r.get("text") or ""))
++        reasoning, text = split_thinking(r.get("text") or "")
++        try:
++            text, calls = parse_calls(text, tools)
++        except ValueError as exc:
++            self._sse_write("data: " + json.dumps(
++                {"error": {"message": str(exc), "type": "invalid_model_output"}}) + "\n\n")
++            self._sse_write("data: [DONE]\n\n")
++            return self._sse_end()
++        if tools:
++            # Hold tool-enabled output until markup is complete. Never leak XML
++            # fragments into content or execute a partially generated call.
++            if reasoning:
++                emit([("reasoning", reasoning)])
++            if text:
++                emit([("content", text)])
++        else:
++            emit(delta.feed(r.get("text") or ""))
++        for index, call in enumerate(calls):
++            self._sse_write("data: " + json.dumps(chunk({"tool_calls": [{
++                "index": index, "id": call["id"], "type": "function",
++                "function": call["function"]}]})) + "\n\n")
+         report(r)
+-        self._sse_write("data: " + json.dumps(chunk({}, finish_reason(r))) + "\n\n")
++        self._sse_write("data: " + json.dumps(chunk({}, finish_reason(r, calls))) + "\n\n")
+         so = req.get("stream_options")
+         if isinstance(so, dict) and so.get("include_usage"):
+             self._sse_write("data: " + json.dumps({
+@@ -736,6 +787,10 @@ class Handler(BaseHTTPRequestHandler):
+         sequence_number, and the ids in the terminal event are the same ids the
+         stream announced.
+         """
++        if req.get("tools"):
++            return self._send(400, {"error": {
++                "message": "function tools require /v1/chat/completions",
++                "type": "invalid_request_error", "param": "tools"}})
+         msgs = responses_messages(req)
+         prompt, how = render_chat(msgs, template_kwargs_from(req))
+         max_tokens = int(req.get("max_output_tokens") or req.get("max_tokens") or 512)
+diff --git a/scripts/bootstrap.sh b/scripts/bootstrap.sh
+index ecbf70b..fa33bb0 100755
+--- a/scripts/bootstrap.sh
++++ b/scripts/bootstrap.sh
+@@ -65,6 +65,7 @@ else
+   python -c "import exllamav3" || fail "exllamav3 still not importable after install"
+ fi
+ python -c "import exllamav3" || fail "exllamav3 import"
++python -c "import jinja2" 2>/dev/null || pip install --no-cache-dir 'jinja2>=3.1,<4' || fail "jinja2 install"
+ 
+ # ----------------------------------------------------------------- the weights
+ status "stage=weights"
+@@ -89,6 +90,7 @@ PY
+   say "weights in $(( $(date +%s) - t0 ))s"
+ fi
+ [ -f "$MODEL_DIR/config.json" ] || fail "no config.json in $MODEL_DIR - the pack is incomplete"
++[ -f "$MODEL_DIR/chat_template.jinja" ] || fail "no chat_template.jinja (required for tool calls)"
+ 
+ # ------------------------------------------------------------------ the env
+ status "stage=env"
+@@ -106,4 +108,4 @@ say "wrote /content/collabosm.env"
+ du -sh "$MODEL_DIR" 2>/dev/null || true
+ nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader || true
+ echo "BOOTSTRAP_OK"
+-status "stage=bootstrapped"
+\ No newline at end of file
++status "stage=bootstrapped"
+diff --git a/scripts/tool_protocol.py b/scripts/tool_protocol.py
+new file mode 100644
+index 0000000..7dc58d5
+--- /dev/null
++++ b/scripts/tool_protocol.py
+@@ -0,0 +1,87 @@
++"""Translate the pinned Qwen chat template's tool XML to OpenAI calls."""
++
++import json
++import re
++import uuid
++
++CALL = re.compile(r"<tool_call>\s*<function=([\w.-]+)>\s*(.*?)\s*</function>\s*</tool_call>", re.S)
++PARAM = re.compile(r"<parameter=([\w.-]+)>\s*\n?(.*?)\s*</parameter>", re.S)
++
++
++def normalize_messages(messages):
++    """The model template wants decoded argument objects, unlike OpenAI's JSON strings."""
++    out = []
++    for message in messages:
++        if not isinstance(message, dict):
++            raise ValueError("messages must contain objects")
++        item = dict(message)
++        if item.get("role") == "developer":
++            item["role"] = "system"
++        if item.get("role") == "assistant" and item.get("tool_calls"):
++            calls = []
++            for call in item["tool_calls"]:
++                if call.get("type") != "function":
++                    raise ValueError("only function tools are supported")
++                fn = dict(call["function"])
++                args = fn.get("arguments", {})
++                fn["arguments"] = json.loads(args) if isinstance(args, str) else args
++                if not isinstance(fn["arguments"], dict):
++                    raise ValueError("tool arguments must be an object")
++                calls.append({**call, "function": fn})
++            item["tool_calls"] = calls
++        out.append(item)
++    return out
++
++
++def validate_tools(tools):
++    if not isinstance(tools, list):
++        raise ValueError("tools must be an array")
++    for tool in tools:
++        if not isinstance(tool, dict) or tool.get("type") != "function":
++            raise ValueError("only function tools are supported")
++        if not isinstance(tool.get("function"), dict) or not tool["function"].get("name"):
++            raise ValueError("each tool needs a function name")
++    return tools
++
++
++def parse_calls(answer, tools):
++    """Return (visible text, tool calls); fail closed on incomplete tool markup.
++
++    Parameter values are strings in the model's XML. JSON object/array/number/
++    boolean values are decoded only when the declared property expects them.
++    """
++    names = {t["function"]["name"]: t["function"].get("parameters", {}) for t in tools}
++    found = list(CALL.finditer(answer))
++    visible = CALL.sub("", answer).strip()
++    if "<tool_call" in visible or "</tool_call>" in visible:
++        raise ValueError("incomplete tool call markup")
++    calls = []
++    for match in found:
++        name, body = match.groups()
++        if name not in names:
++            raise ValueError("undeclared tool: " + name)
++        args = {}
++        props = names[name].get("properties", {})
++        remainder = PARAM.sub("", body)
++        if remainder.strip():
++            raise ValueError("invalid parameter markup for " + name)
++        for param in PARAM.finditer(body):
++            key, value = param.groups()
++            if key in args:
++                raise ValueError("duplicate tool parameter: " + key)
++            if key not in props and names[name].get("additionalProperties") is False:
++                raise ValueError("undeclared tool parameter: " + key)
++            expected = props.get(key, {}).get("type") if isinstance(props.get(key), dict) else None
++            value = value.strip()
++            if expected in ("object", "array", "number", "integer", "boolean"):
++                try:
++                    value = json.loads(value)
++                except json.JSONDecodeError as exc:
++                    raise ValueError("invalid JSON parameter: " + key) from exc
++            args[key] = value
++        missing = set(names[name].get("required", [])) - args.keys()
++        if missing:
++            raise ValueError("missing required tool parameters: " + ", ".join(sorted(missing)))
++        calls.append({"id": "call_" + uuid.uuid4().hex, "type": "function",
++                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
++    return visible, calls
